@@ -19,7 +19,6 @@ import (
 )
 
 // Info describes the Adapter and provides a function to a Handler Builder method.
-// TODO change this to Info when we delete the ApplicationLog.Info enum.
 type Info struct {
 	// Name returns the official name of the adapter, it must be RFC 1035 compatible DNS label.
 	// Regex: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
@@ -36,7 +35,7 @@ type Info struct {
 	// NewBuilder is a function that creates a Builder which implements Builders associated
 	// with the SupportedTemplates.
 	NewBuilder NewBuilderFn
-	// SupportedTemplates expressess all the templates the Adapter wants to serve.
+	// SupportedTemplates expresses all the templates the Adapter wants to serve.
 	SupportedTemplates []string
 	// DefaultConfig is a default configuration struct for this
 	// adapter. This will be used by the configuration system to establish

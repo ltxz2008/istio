@@ -15,23 +15,17 @@
 package e2e
 
 import (
-	"context"
-	"io"
-	"log"
-	"os"
 	"testing"
 
-	istio_mixer_v1 "istio.io/api/mixer/v1"
-	pb "istio.io/api/mixer/v1/config/descriptor"
-	testEnv "istio.io/istio/mixer/pkg/mock"
-	"istio.io/istio/mixer/pkg/template"
-	spyAdapter "istio.io/istio/mixer/test/spyAdapter"
+	"istio.io/api/mixer/adapter/model/v1beta1"
+	pb "istio.io/api/policy/v1beta1"
+	spyadapter "istio.io/istio/mixer/test/spyAdapter"
 	e2eTmpl "istio.io/istio/mixer/test/spyAdapter/template"
 	reportTmpl "istio.io/istio/mixer/test/spyAdapter/template/report"
 )
 
 const (
-	globalCfg = `
+	reportGlobalCfg = `
 apiVersion: "config.istio.io/v1alpha2"
 kind: attributemanifest
 metadata:
@@ -55,7 +49,168 @@ spec:
         value_type: INT64
 ---
 `
-	reportTestCfg = `
+)
+
+func TestReport(t *testing.T) {
+	tests := []testData{
+
+		{
+			name: "Basic Report",
+			cfg: `
+apiVersion: "config.istio.io/v1alpha2"
+kind: handler
+metadata:
+  name: fakeHandlerConfig
+  namespace: istio-system
+spec:
+  compiledAdapter: fakeHandler
+
+---
+
+apiVersion: "config.istio.io/v1alpha2"
+kind: instance
+metadata:
+  name: reportInstance
+  namespace: istio-system
+spec:
+  compiledTemplate: samplereport
+  params:
+    value: response.count | 0
+    dimensions:
+      source: source.name | "mysrc"
+      target_ip: target.name | "mytarget"
+
+---
+
+apiVersion: "config.istio.io/v1alpha2"
+kind: rule
+metadata:
+  name: rule1
+  namespace: istio-system
+spec:
+  match: match(target.name, "*")
+  actions:
+  - handler: fakeHandlerConfig.handler
+    instances:
+    - reportInstance.instance
+
+---
+`,
+			attrs: map[string]interface{}{
+				"target.name":    "somesrvcname",
+				"response.count": int64(2),
+			},
+
+			expectSetTypes: map[string]interface{}{
+				"reportInstance.instance.istio-system": &reportTmpl.Type{
+					Value:      pb.INT64,
+					Dimensions: map[string]pb.ValueType{"source": pb.STRING, "target_ip": pb.STRING},
+				},
+			},
+
+			expectCalls: []spyadapter.CapturedCall{
+				{
+					Name: "HandleSampleReport",
+					Instances: []interface{}{
+						&reportTmpl.Instance{
+							Name:       "reportInstance.instance.istio-system",
+							Value:      int64(2),
+							Dimensions: map[string]interface{}{"source": "mysrc", "target_ip": "somesrvcname"},
+						},
+					},
+				},
+			},
+		},
+
+		{
+			name: "Multi Instance Report",
+			cfg: `
+apiVersion: "config.istio.io/v1alpha2"
+kind: fakeHandler
+metadata:
+  name: fakeHandlerConfig
+  namespace: istio-system
+
+---
+# Instance 1
+apiVersion: "config.istio.io/v1alpha2"
+kind: samplereport
+metadata:
+  name: reportInstance1
+  namespace: istio-system
+spec:
+  value: "2"
+  dimensions:
+    source: source.name | "mysrc"
+    target_ip: target.name | "mytarget"
+
+---
+# Instance 2
+apiVersion: "config.istio.io/v1alpha2"
+kind: samplereport
+metadata:
+  name: reportInstance2
+  namespace: istio-system
+spec:
+  value: "5"
+  dimensions:
+    source: source.name | "yoursrc"
+    target_ip: target.name | "yourtarget"
+
+---
+
+apiVersion: "config.istio.io/v1alpha2"
+kind: rule
+metadata:
+  name: rule1
+  namespace: istio-system
+spec:
+  match: match(target.name, "*")
+  actions:
+  - handler: fakeHandlerConfig.fakeHandler
+    instances:
+    - reportInstance1.samplereport
+    - reportInstance2.samplereport
+
+---
+`,
+			attrs: map[string]interface{}{
+				"target.name": "somesrvcname",
+			},
+
+			expectSetTypes: map[string]interface{}{
+				"reportInstance1.samplereport.istio-system": &reportTmpl.Type{
+					Value:      pb.INT64,
+					Dimensions: map[string]pb.ValueType{"source": pb.STRING, "target_ip": pb.STRING},
+				},
+				"reportInstance2.samplereport.istio-system": &reportTmpl.Type{
+					Value:      pb.INT64,
+					Dimensions: map[string]pb.ValueType{"source": pb.STRING, "target_ip": pb.STRING},
+				},
+			},
+
+			expectCalls: []spyadapter.CapturedCall{
+				{
+					Name: "HandleSampleReport",
+					Instances: []interface{}{
+						&reportTmpl.Instance{
+							Name:       "reportInstance1.samplereport.istio-system",
+							Value:      int64(2),
+							Dimensions: map[string]interface{}{"source": "mysrc", "target_ip": "somesrvcname"},
+						},
+						&reportTmpl.Instance{
+							Name:       "reportInstance2.samplereport.istio-system",
+							Value:      int64(5),
+							Dimensions: map[string]interface{}{"source": "yoursrc", "target_ip": "somesrvcname"},
+						},
+					},
+				},
+			},
+		},
+
+		{
+			name: "Conditional Report with No Success",
+			cfg: `
 apiVersion: "config.istio.io/v1alpha2"
 kind: fakeHandler
 metadata:
@@ -83,107 +238,33 @@ metadata:
   name: rule1
   namespace: istio-system
 spec:
-  selector: match(target.name, "*")
+  match: match(target.name, "some unknown thing")
   actions:
   - handler: fakeHandlerConfig.fakeHandler
     instances:
     - reportInstance.samplereport
 
 ---
-`
-)
-
-type testData struct {
-	name      string
-	cfg       string
-	behaviors []spyAdapter.AdapterBehavior
-	templates map[string]template.Info
-	attrs     map[string]interface{}
-	validate  func(t *testing.T, err error, sypAdpts []*spyAdapter.Adapter)
-}
-
-func closeHelper(c io.Closer) {
-	err := c.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func TestReport(t *testing.T) {
-	tests := []testData{
-		{
-			name:      "Report",
-			cfg:       reportTestCfg,
-			behaviors: []spyAdapter.AdapterBehavior{{Name: "fakeHandler"}},
-			templates: e2eTmpl.SupportedTmplInfo,
-			attrs:     map[string]interface{}{"target.name": "somesrvcname"},
-			validate: func(t *testing.T, err error, spyAdpts []*spyAdapter.Adapter) {
-
-				adptr := spyAdpts[0]
-
-				CmpMapAndErr(t, "SetSampleReportTypes input", adptr.BuilderData.SetSampleReportTypesTypes,
-					map[string]interface{}{
-						"reportInstance.samplereport.istio-system": &reportTmpl.Type{
-							Value:      pb.INT64,
-							Dimensions: map[string]pb.ValueType{"source": pb.STRING, "target_ip": pb.STRING},
-						},
-					},
-				)
-
-				CmpSliceAndErr(t, "HandleSampleReport input", adptr.HandlerData.HandleSampleReportInstances,
-					[]*reportTmpl.Instance{
-						{
-							Name:       "reportInstance.samplereport.istio-system",
-							Value:      int64(2),
-							Dimensions: map[string]interface{}{"source": "mysrc", "target_ip": "somesrvcname"},
-						},
-					},
-				)
+`,
+			attrs: map[string]interface{}{
+				"target.name": "somesrvcname",
 			},
+
+			expectCalls: nil,
 		},
 	}
+
 	for _, tt := range tests {
-		configDir := GetCfgs(tt.cfg, globalCfg)
-		defer func() {
-			if !t.Failed() {
-				_ = os.RemoveAll(configDir)
-			} else {
-				t.Logf("The configs are located at %s", configDir)
-			}
-		}() // nolint: gas
-
-		var args = testEnv.Args{
-			// Start Mixer server on a free port on loop back interface
-			MixerServerAddr:               `127.0.0.1:0`,
-			ConfigStoreURL:                `fs://` + configDir,
-			ConfigStore2URL:               `fs://` + configDir,
-			ConfigDefaultNamespace:        "istio-system",
-			ConfigIdentityAttribute:       "destination.service",
-			ConfigIdentityAttributeDomain: "svc.cluster.local",
+		if tt.templates == nil {
+			tt.templates = e2eTmpl.SupportedTmplInfo
 		}
 
-		adapterInfos, spyAdapters := ConstructAdapterInfos(tt.behaviors)
-		env, err := testEnv.NewServer(&args, e2eTmpl.SupportedTmplInfo, adapterInfos)
-		if err != nil {
-			t.Fatalf("fail to create mock: %v", err)
+		if tt.behaviors == nil {
+			tt.behaviors = []spyadapter.AdapterBehavior{{Name: "fakeHandler"}}
 		}
 
-		defer closeHelper(env)
-
-		client, conn, err := env.CreateClient()
-		if err != nil {
-			t.Fatalf("fail to create client connection: %v", err)
-		}
-		defer closeHelper(conn)
-
-		req := istio_mixer_v1.ReportRequest{
-			Attributes: []istio_mixer_v1.CompressedAttributes{
-				testEnv.GetAttrBag(tt.attrs,
-					args.ConfigIdentityAttribute,
-					args.ConfigIdentityAttributeDomain)},
-		}
-		_, err = client.Report(context.Background(), &req)
-
-		tt.validate(t, err, spyAdapters)
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t, v1beta1.TEMPLATE_VARIETY_REPORT, reportGlobalCfg)
+		})
 	}
 }

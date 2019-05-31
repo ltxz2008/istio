@@ -108,10 +108,6 @@ func ilType(t reflect.Type) il.Type {
 		return il.Integer
 	case reflect.Float64:
 		return il.Double
-	case reflect.Map:
-		if t.Key().Kind() == reflect.String || t.Elem().Kind() == reflect.String {
-			return il.Interface
-		}
 	case reflect.Slice:
 		if t.Elem().Kind() == reflect.Uint8 {
 			return il.Interface
@@ -120,10 +116,11 @@ func ilType(t reflect.Type) il.Type {
 		switch t.Name() {
 		case "Time":
 			return il.Interface
+		case "StringMap":
+			return il.Interface
 		}
 	case reflect.Interface:
-		switch t.Name() {
-		case "StringMap":
+		if t.Name() == "StringMap" {
 			return il.Interface
 		}
 	}
@@ -139,7 +136,7 @@ func ilType(t reflect.Type) il.Type {
 //
 // The function returns two uint32 values in the push order (i.e. first uint32 to be pushed on to
 // the stack first).
-func (e Extern) invoke(s *il.StringTable, heap []interface{}, hp *uint32, stack []uint32, sp uint32) (uint32, uint32, error) {
+func (e Extern) invoke(_ *il.StringTable, heap []interface{}, hp *uint32, stack []uint32, sp uint32) (uint32, uint32, error) {
 
 	// Convert the parameters on stack to reflect.Values.
 	ins := make([]reflect.Value, len(e.paramTypes))
@@ -150,7 +147,7 @@ func (e Extern) invoke(s *il.StringTable, heap []interface{}, hp *uint32, stack 
 
 		switch e.paramTypes[i] {
 		case il.String:
-			str := s.GetString(stack[ap])
+			str := heap[stack[ap]].(string)
 			ins[i] = reflect.ValueOf(str)
 
 		case il.Bool:
@@ -209,8 +206,9 @@ func (e Extern) invoke(s *il.StringTable, heap []interface{}, hp *uint32, stack 
 	switch e.returnType {
 	case il.String:
 		str := rv.String()
-		id := s.GetID(str)
-		return id, 0, nil
+		heap[*hp] = str
+		*hp++
+		return *hp - 1, 0, nil
 
 	case il.Bool:
 		if rv.Bool() {

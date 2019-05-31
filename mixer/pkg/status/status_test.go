@@ -16,11 +16,13 @@ package status
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	rpc "github.com/googleapis/googleapis/google/rpc"
-	multierror "github.com/hashicorp/go-multierror"
+	rpc "github.com/gogo/googleapis/google/rpc"
+	"github.com/gogo/protobuf/types"
+
+	"istio.io/api/policy/v1beta1"
 )
 
 func TestStatus(t *testing.T) {
@@ -73,38 +75,111 @@ func TestStatus(t *testing.T) {
 		t.Errorf("Got %v %v, expected rpc.DEADLINE_EXCEEDED Aborted!", s.Code, s.Message)
 	}
 
-	s = InvalidWithDetails("Invalid", NewBadRequest("test", errors.New("error")))
-	if s.Code != int32(rpc.INVALID_ARGUMENT) && s.Message != "Invalid" && len(s.Details) != 1 {
-		t.Errorf("Got %v, expected status with code = rpc.INVALID_ARGUMENT and populated details", s)
+	s = WithUnknown("Aborted!")
+	if s.Code != int32(rpc.UNKNOWN) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.UNKNOWN Aborted!", s.Code, s.Message)
+	}
+
+	s = WithNotFound("Aborted!")
+	if s.Code != int32(rpc.NOT_FOUND) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.NOT_FOUND Aborted!", s.Code, s.Message)
+	}
+
+	s = WithAlreadyExists("Aborted!")
+	if s.Code != int32(rpc.ALREADY_EXISTS) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.ALREADY_EXISTS Aborted!", s.Code, s.Message)
+	}
+
+	s = WithFailedPrecondition("Aborted!")
+	if s.Code != int32(rpc.FAILED_PRECONDITION) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.FAILED_PRECONDITION Aborted!", s.Code, s.Message)
+	}
+
+	s = WithAborted("Aborted!")
+	if s.Code != int32(rpc.ABORTED) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.ABORTED Aborted!", s.Code, s.Message)
+	}
+
+	s = WithOutOfRange("Aborted!")
+	if s.Code != int32(rpc.OUT_OF_RANGE) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.OUT_OF_RANGE Aborted!", s.Code, s.Message)
+	}
+
+	s = WithUnimplemented("Aborted!")
+	if s.Code != int32(rpc.UNIMPLEMENTED) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.UNIMPLEMENTED Aborted!", s.Code, s.Message)
+	}
+
+	s = WithUnavailable("Aborted!")
+	if s.Code != int32(rpc.UNAVAILABLE) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.UNAVAILABLE Aborted!", s.Code, s.Message)
+	}
+
+	s = WithOutOfRange("Aborted!")
+	if s.Code != int32(rpc.OUT_OF_RANGE) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.OUT_OF_RANGE Aborted!", s.Code, s.Message)
+	}
+
+	s = WithDataLoss("Aborted!")
+	if s.Code != int32(rpc.DATA_LOSS) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.DATA_LOSS Aborted!", s.Code, s.Message)
+	}
+
+	s = WithUnauthenticated("Aborted!")
+	if s.Code != int32(rpc.UNAUTHENTICATED) || s.Message != "Aborted!" {
+		t.Errorf("Got %v %v, expected rpc.UNAUTHENTICATED Aborted!", s.Code, s.Message)
+	}
+
+	msg := String(s)
+	if msg == "" {
+		t.Errorf("Expecting valid string, got nothing")
+	}
+
+	s = rpc.Status{Code: -123}
+	msg = String(s)
+	if msg == "" {
+		t.Errorf("Expecting valid string, got nothing")
+	}
+
+	s = OK
+	msg = String(s)
+	if msg == "" {
+		t.Errorf("Expecting valid string, got nothing")
 	}
 }
 
-func TestNewBadRequest(t *testing.T) {
-	me := multierror.Append(errors.New("error one"), errors.New("error two"))
-
-	cases := []struct {
-		name  string
-		field string
-		err   error
-		want  *rpc.BadRequest
-	}{
-		{"simple error", "field", errors.New("error"), newBadReq(newViolation("error"))},
-		{"go-multierror", "field", me, newBadReq(newViolation("error one"), newViolation("error two"))},
+func TestErrorDetail(t *testing.T) {
+	if response := GetDirectHTTPResponse(OK); response != nil {
+		t.Errorf("GetDirectHTTPResponse(OK) => got %#v, want nil", response)
 	}
-	for _, v := range cases {
-		t.Run(v.name, func(t *testing.T) {
-			got := NewBadRequest(v.field, v.err)
-			if !proto.Equal(got, v.want) {
-				t.Fatalf("Got %v, want %v", got, v.want)
-			}
-		})
+
+	response := &v1beta1.DirectHttpResponse{
+		Code:    v1beta1.MovedPermanently,
+		Body:    "istio.io/api",
+		Headers: map[string]string{"location": "istio.io/api"},
+	}
+	any := PackErrorDetail(response)
+
+	s := rpc.Status{Code: int32(rpc.UNAUTHENTICATED), Details: []*types.Any{
+		nil,
+		{TypeUrl: "types.google.com/istio.policy.v1beta1.DirectHttpResponse", Value: []byte{1}},
+		any,
+	}}
+
+	if got := GetDirectHTTPResponse(s); !reflect.DeepEqual(got, response) {
+		t.Errorf("GetDirectHTTPResponse => got %#v, want %#v", got, response)
 	}
 }
 
-func newViolation(desc string) *rpc.BadRequest_FieldViolation {
-	return &rpc.BadRequest_FieldViolation{Field: "field", Description: desc}
-}
+func TestStatusCode(t *testing.T) {
+	for code := range rpc.Code_name {
+		httpCode := HTTPStatusFromCode(rpc.Code(code))
+		if httpCode < 200 || httpCode > 600 {
+			t.Errorf("unexpected HTTP code after translation: %d", httpCode)
+		}
+	}
 
-func newBadReq(violations ...*rpc.BadRequest_FieldViolation) *rpc.BadRequest {
-	return &rpc.BadRequest{FieldViolations: violations}
+	if code := HTTPStatusFromCode(rpc.Code(-1)); code != 500 {
+		t.Errorf("unexpected undefined HTTP code: %d", code)
+	}
 }

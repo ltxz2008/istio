@@ -17,44 +17,12 @@
 package adapter
 
 import (
-	"io"
-
 	"github.com/gogo/protobuf/proto"
 )
 
 type (
-	// Aspect represents a type of end-user functionality with particular semantics. Adapters
-	// expose functionality to Mixer by implementing one or more aspects.
-	Aspect interface {
-		io.Closer
-	}
-
-	// Builder represents a factory of aspects. Adapters register builders with Mixer
-	// in order to allow Mixer to instantiate aspects on demand.
-	Builder interface {
-		io.Closer
-		ConfigValidator
-
-		// Name returns the official name of the aspects produced by this builder.
-		Name() string
-
-		// Description returns a user-friendly description of the aspects produced by this builder.
-		Description() string
-	}
-
 	// Config represents a chunk of adapter configuration state
 	Config proto.Message
-
-	// ConfigValidator handles adapter configuration defaults and validation.
-	ConfigValidator interface {
-		// DefaultConfig returns a default configuration struct for this
-		// adapter. This will be used by the configuration system to establish
-		// the shape of the block of configuration state passed to the NewAspect method.
-		DefaultConfig() (c Config)
-
-		// ValidateConfig determines whether the given configuration meets all correctness requirements.
-		ValidateConfig(c Config) *ConfigErrors
-	}
 
 	// WorkFunc represents a function to invoke.
 	WorkFunc func()
@@ -62,9 +30,9 @@ type (
 	// DaemonFunc represents a function to invoke asynchronously to run a long-running background processing loop.
 	DaemonFunc func()
 
-	// Env defines the environment in which an aspect executes.
+	// Env defines the environment in which an adapter executes.
 	Env interface {
-		// Logger returns the logger for the aspect to use at runtime.
+		// Logger returns the logger for the adapter to use at runtime.
 		Logger() Logger
 
 		// ScheduleWork records a function for execution.
@@ -89,24 +57,16 @@ type (
 		ScheduleDaemon(fn DaemonFunc)
 
 		// Possible other features for Env:
-		// Return how much time remains until Mixer considers the aspect call having timed out and kills it
-		// Return true/false to indicate this is a 'recovery mode' execution following a prior crash of the aspect
+		// Return how much time remains until Mixer considers the adapter call having timed out and kills it
+		// Return true/false to indicate this is a 'recovery mode' execution following a prior crash of the adapter
 		// ?
 	}
 
-	// Logger defines where aspects should output their log state to.
+	// Logger defines where adapters should output their log state to.
 	//
-	// This log information is funneled to Mixer which augments it with
+	// This log is funneled to Mixer which augments it with
 	// desirable metadata and then routes it to the right place.
 	Logger interface {
-		// Used to determine if the supplied verbosity level is enabled.
-		// Example:
-		//
-		// if env.Logger().VerbosityLevel(4) {
-		//   env.Logger().Infof(...)
-		// }
-		VerbosityLevel(level VerbosityLevel) bool
-
 		// Infof logs optional information.
 		Infof(format string, args ...interface{})
 
@@ -117,9 +77,20 @@ type (
 		// In addition to generating a log record for the error, this also returns
 		// an error instance for convenience.
 		Errorf(format string, args ...interface{}) error
-	}
 
-	// VerbosityLevel is used to control the level of detailed logging for
-	// adapters.
-	VerbosityLevel int32
+		// Debugf logs potentially verbose debug-time data
+		Debugf(format string, args ...interface{})
+
+		// InfoEnabled returns whether output of messages at the info level is currently enabled.
+		InfoEnabled() bool
+
+		// InfoEnabled returns whether output of messages at the warn level is currently enabled.
+		WarnEnabled() bool
+
+		// ErrorEnabled returns whether output of messages at the wanr level is currently enabled.
+		ErrorEnabled() bool
+
+		// DebugEnabled returns whether output of messages at the debug level is currently enabled.
+		DebugEnabled() bool
+	}
 )

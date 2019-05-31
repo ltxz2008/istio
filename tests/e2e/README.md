@@ -1,118 +1,60 @@
-# e2e Testing
+# End-to-End Testing
 
-This directory contains Istio end-to-end tests and test framework.
+This directory contains Istio end-to-end tests and associated test framework.
 
-## e2e test environment
-You need a k8s cluster to run tests.
+E2E tests are meant for ensure functional correctness in an E2E environment to make sure Istio works with one or more deployments. For now, these tests run with GKE in Prow and Minikube in CircleCI in both pre-submit and post-submit stages. Their results can be found in https://prow.istio.io/ and https://k8s-testgrid.appspot.com/istio.
+
+Developers, on the other hand, are recommended to run the tests locally before sending out any PR.
+
+
+# Running E2E Tests
+
+## Using a local VM
+E2E tests can be run on your local machines. It helps local testing and debuging. You can use one of the following to set up a local testing environment.
+
+1. See [vagrant/README](local/vagrant/README.md) for instructions to set up a local Vagrant VM environment to run E2E tests.
+
+2. See [minikube/README](local/minikube/README.md) for instructions to set up a Minikube VM environment to run E2E tests.
+
+All local testing options requires the `--use_local_cluster` flag so the framework will not create a LoadBalancer and talk directly to the Pod running istio-ingress.
+
+
+## Using GKE
+Optionally, you can set up a GKE environment to run the E2E tests. See [instructions](UsingGKE.md).
+
+
+## Using CI (PR pre-submit stage)
+You can send a PR to trigger all E2E tests in CI, but you should run these tests locally before sending it out to avoid wasting valuable and shared CI resources.
+
+By default, CI does not run all GKE based E2E tests in pre-submit, but they are be triggered manually using the following commands after "prow/istio-presubmit" completes and has generated the required artifacts for testing.
+
+`/test e2e-suite-rbac-no_auth`
+
+`/test e2e-suite-rbac-auth`
+
+`/test e2e-cluster_wide-auth`
+
+
+## Debugging
+The requests from the containers deployed in tests are performed by `client` program.
+For example, to perform a call from a deployed test container to https://console.bluemix.net/, run:
+
 ```bash
-gcloud container clusters create ${CLUSTER_NAME} --zone ${ZONE} --project ${PROJECT_NAME} --cluster-version ${CLUSTER_VERSION} \
-  --machine-type ${MACHINE_TYPE} --num-nodes ${NUM_NODES} --enable-kubernetes-alpha --no-enable-legacy-authorization
- ```
- - `CLUSTER_VERSION`: Latest 1.7.x k8s cluster.
- - `MACHINE_TYPE`: n1-standard-4
- - `NUM_NODES`: Minimum 1.
- - `no-enable-legacy-authorization`: Optional, needed if you want to test rbac.
-
-If you hit the error
-```bash
-Error from server (Forbidden): error when creating "install/kubernetes/istio.yaml": clusterroles.rbac.authorization.k8s.io "istio-pilot" is forbidden: attempt to grant extra privileges: [{[*] [istio.io] [istioconfigs] [] []} {[*] [istio.io] [istioconfigs.istio.io] [] []} {[*] [extensions] [thirdpartyresources] [] []} {[*] [extensions] [thirdpartyresources.extensions] [] []} {[*] [extensions] [ingresses] [] []} {[*] [] [configmaps] [] []} {[*] [] [endpoints] [] []} {[*] [] [pods] [] []} {[*] [] [services] [] []}] user=&{user@example.org [...]
-```
-You need to add the following: (replace the name with your own)
-```
-kubectl create clusterrolebinding myname-cluster-admin-binding --clusterrole=cluster-admin --user=myname@example.org
+kubectl exec -it <test pod> -n <test namespace> -c app -- client -url https://console.bluemix.net/
 ```
 
-## e2e.sh
-
-Each test has its own directory and would be built as a go_test target.
-Tests could be built and drove manually as a single test or automatically detected and ran by [e2e.sh](../e2e.sh)
-
-### Options
-* `--namespace` specify a namespace for test
-* `--mixer_hub` mixer image hub
-* `--mixer_tag` mixer image tag
-* `--pilot_hub` pilot image hub
-* `--pilot_tag` pilot image tag
-* `--ca_hub` CA image hub
-* `--ca_tag` CA image tag
-* `--verbose` debug level noise from proxies
-* `--istioctl_url` the location of an `istioctl` binary
-* `--skip_cleanup` if skip cleanup steps
-* `--log_provider` where cluster logs are hosted, only support `stackdriver` for now
-* `--project_id` project id used to filter logs from provider
-* `--use_local_cluster` whether the cluster is local or not
-* `--parallel` run tests in parallel (sequentially if without flag)
-
-Default values for the `mixer_hub/tag`, `pilot_hub/tag`, and `istioctl_url` are as specified in
-[istio.VERSION](../../istio.VERSION), which are latest tested stable version pairs.
-
-istio.VERSION can be updated by [updateVersion.sh](../../updateVersion.sh).
-Look at [Integration Test](https://github.com/istio/istio/tree/master/tests#updateversionsh) for more information.
-
-If not specify `namespace`, a randomly namespace would be generated for each test.
-
-`log_provider` and `project_id` must both be specified if one wishes to collect cluster logs.
-
-### For all the following example, you always need to add:
-* `--auth_enable` if you want to include auth
-* `--cluster_wide` if you want to run the cluster wide installation and tests
-* `--use_initializer` if you want to do transparent sidecar injection
-
-### Example
-From the repo checkout root directory
-
-* Run tests with the latest stable version of istio according to istio.VERSION :
-
-`tests/e2e.sh --auth_enable`
-
-* Test commit in pilot repo, SHA:"dc738396fd21ab9779853635dd22693d9dd3f78a":
-
-`tests/e2e.sh --pilot_hub=gcr.io/istio-testing --pilot_tag=dc738396fd21ab9779853635dd22693d9dd3f78a --istioctl_url=https://storage.googleapis.com/istio-artifacts/dc738396fd21ab9779853635dd22693d9dd3f78a/artifacts/istioctl --auth_enable`
-
-* If you want to run one specific test, you can do:
+To see its usage run:
 
 ```
-source istio.VERSION
-# Each time pilot SHA changes, get the matching istioctl binary
-# for instance on a mac:
-curl $ISTIOCTL_URL/istioctl-osx > ~/istioctl-osx ; chmod 755 ~/istioctl-osx
-# Each time the test code changes, rebuild the test, for instance:
-bazel build //tests/e2e/tests/simple:go_default_test
-# First time you want to run: deploy in namespace e2e and leave it running:
-./bazel-bin/tests/e2e/tests/simple/go_default_test -alsologtostderr -test.v -v 2  --skip_cleanup --namespace=e2e -istioctl ~/istioctl-osx --auth_enable
-# Subsequent runs if only the TestSimpleIngress (for instance) changes:
-./bazel-bin/tests/e2e/tests/simple/go_default_test -alsologtostderr -test.v -v 2  --skip_setup --skip_cleanup --namespace=e2e -istioctl ~/istioctl-osx --auth_enable --test.run TestSimpleIngress
+kubectl exec -it <test pod> -n <test namespace> -c app -- client -h
 ```
 
 
-## Access to logs and temp files from Jenkins
+# Adding New E2E Tests
+[demo_test.go](tests/bookinfo/demo_test.go) is a sample test that covers four cases: default routing, version routing, fault delay, and version migration.
+Each case applies traffic rules and then clean up after the test. It can serve as a reference for building new test cases.
 
-If tests ran in presubmit on Jenkins, you can easily access to logs and temp files. Go to your pr page on Jenkins console "https://testing.istio.io/job/istio/job/presubmit/<pr_number>", click "artifacts.html", and it will lead you to tests records.
-
-## demo_test.go
-
-[demo_test.go](tests/bookinfo/demo_test.go) is a sample test.
-It's based on the shell script version of demo test. It has four test cases: default routing, version routing, fault delay and version migration. Each test case applies specific rules for itself and clean them up after finishing.
-
-You can build and run this or any single test manually with the same options as e2e.sh when testing specific version of master, mixer or istioctl
-
-
-## Developer process
-
-### Cluster in same local network
-In order to talk to istio ingress, we use the ingress IP by default. If your
-cluster is on the same local network and cannot provide external IP (for example, minikube), use the `--use-local-cluster` flag.
-In that case, the framework will not create a LoadBalancer and talk directly to the Pod running istio-ingress.
-
-### Testing code change
-1. Run `e2e.sh --pilot_hub <pilot hub> --pilot_tag <pilot tag> --istioctl_url <istioctl url>` or
-   `e2e.sh --mixer_hub <mixer hub> --mixer_tag <mixer tag>` to test your changes to pilot, mixer, respectively.
-2. Submit a PR with your changes to `istio/pilot` or `istio/mixer`.
-3. Run `updateVersion.sh` to update the default Istio install configuration and then
-   submit a PR  to `istio/istio` for the version change. (Only admin)
-
-### Writing tests
-Follow the sample of demo_test.go
+See below for guidelines for creating a new E2E test.
 1. Create a new commonConfig for framework and add app used for this test in setTestConfig().
    Each test file has a `testConfig` handling framework and test configuration.
    `testConfig` is a cleanable structure which has  `Setup` and `Teardown`. `Setup` will run before all tests and `Teardown`
@@ -122,30 +64,55 @@ Follow the sample of demo_test.go
    These could be done in `testConfig.Setup()` and would be executed by cleanup register right after framework setup.
 4. Write a test. Test case name should start with 'Test' and using 't *testing.T' to log test failures.
    There is no guarantee for running order
-4. Each test file is supposed to have a `BUILD` and is built as a go_test target in its own director. Target must have
-   `tags =  ["manual"]`, since tests cannot ran by `bazel test` who runs tests in sandbox where you can't connect to cluster.
 
-### Debugging
-The requests from the containers deployed in tests are performed by `client` program.
-For example, to perform a call from a deployed test container to https://console.bluemix.net/, run:
 
-`kubectl exec -it <test pod> -n <test namespace> -c app -- client -url https://console.bluemix.net/`
+# Test Framework Notes
 
-To see its usage run:
+The E2E test framework defines and creates structures and processes for creating cleanable test environments:
+install and setup istio modules and clean up afterward.
 
-`kubectl exec -it <test pod> -n <test namespace> -c app -- client -h`
+Writing new tests doesn't require knowledge of the framework.
 
-## Framework
+- framework.go: `Cleanable` is a interface defined with setup() and teardown(). While initialization, framework calls setup() from all registered cleanable
+structures and calls teardown() while framework cleanup. The cleanable register works like a stack, first setup, last teardown.
 
-e2e framework defines and creates structure and processes for creating cleanable test environment: install and setup istio modules and clean up afterward.
+- kubernetes.go: `KubeInfo` handles interactions between tests and kubectl, installs istioctl and apply istio module. Module yaml files are in Helm charts
+[install/kubernetes/helm](../../install/kubernetes/helm) and will finally use all-in-one yaml [istio.yaml](../../install/kubernetes/istio.yaml)
 
-Testing code or writing tests don't require knowledge of framework, it should be transparent for test writers
+- appManager.go: gather apps required for test into a array and deploy them while setup()
 
-### framework.go
-`Cleanable` is a interface defined with setup() and teardown(). While initialization, framework calls setup() from all registered cleanable structures and calls teardown() while framework cleanup. The cleanable register works like a stack, first setup, last teardown.
+# Options For E2E Tests
 
-### kubernetes.go
-`KubeInfo` handles interactions between tests and kubectl, installs istioctl and apply istio module. Module yaml files are in store at [install/kubernetes/templates](../../install/kubernetes/templates) and will finally use all-in-one yaml [istio.yaml](../../install/kubernetes/istio.yaml)
+E2E tests have multiple options available while running them as follows:
 
-### appManager.go
-`appManager` gather apps required for test into a array and deploy them while setup()
+* `--skip_setup` - Skip namespace creation and istio cluster setup (default: false)
+* `--skip_cleanup` - Skip the cleanup steps (default: false)
+* `--namespace <namespace>` - If you don't specify `namespace`, a random namespace is generated for each test.
+* `--use_local_cluster` - If true any LoadBalancer type services will be converted to a NodePort service during testing. If running on minikube, this should be set to true. (default: false)
+* `--auth_enable` - If you want to include auth (default: false)
+* `--rbac_enabled` - Enable RBAC (default: true)
+* `--cluster_wide` - If true Pilot/Mixer will observe all namespaces rather than just the testing namespace (default: false)
+* `--use_automatic_injection` - if you want to do transparent sidecar injection  (default: false)
+* `--use_galley_config_validator` - if you want to enable automatic configuration validation (default: false)
+* `--mixer_hub <hub>` - Image hub for the Mixer (default: environment $HUB)
+* `--mixer_tag <tag>` - Image tag for the Mixer (default: environment $TAG)
+* `--pilot_hub <hub>` - Image hub for the Pilot (default: environment $HUB)
+* `--pilot_tag <tag>` - Image tag for the Pilot (default: environment $TAG)
+* `--proxy_hub <hub>` - Image hub for the Proxy (default: environment $HUB)
+* `--proxy_tag <tag>` - Image tag for the Proxy (default: environment $TAG)
+* `--ca_hub <hub>` - Image hub for the Citadel (default: environment $HUB)
+* `--ca_tag <tag>` - Image tag for the Citadel (default: environment $TAG)
+* `--galley_hub <hub>` - Image hub for the Sidecar Injector (default: environment $HUB)
+* `--galley_tag <tag>` - Image tag for the Sidecar Injector (default: environment $TAG)
+* `--sidecar_injector_hub <hub>` - Image hub for the Sidecar Injector (default: environment $HUB)
+* `--sidecar_injector_tag <tag>` - Image tag for the Sidecar Injector (default: environment $TAG)
+* `--sidecar_injector_file <file>` - Sidecar injector YAML file name (default: istio-sidecar-injector.yaml)
+* `--image_pull_policy <policy>` - Specifies an override for the Docker image pull policy to be used
+* `--cluster_registry_dir <dir>` - Directory name for the cluster registry config. When provided this will trigger a multicluster test to be run across two clusters. 
+* `--installer <cmd>` - Use `helm` or `kubectl` to install Istio (default: kubectl)
+* `--kube_inject_configmap <configmap>` - Istioctl will use the specified configmap when running kube-inject (default: ""). This will normally be used with the CNI option to override the embedded initContainers insertion.
+* `--split_horizon` - Set up a split horizon EDS multi-cluster test environment (default: false)
+*
+* `--use_mcp` - If true will use MCP for configuring Istio components (default: true)
+* `--use_cni` - If true install the Istio CNI which will add the IP table rules for Envoy instead of the init container (default: false)
+* `--cniHelmRepo` - Location/name of the Istio-CNI helm (default: istio.io/istio-cni)

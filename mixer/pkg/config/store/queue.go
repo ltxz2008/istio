@@ -15,71 +15,53 @@
 package store
 
 import (
-	"context"
-
 	"github.com/gogo/protobuf/proto"
-	"github.com/golang/glog"
+
+	"istio.io/pkg/log"
 )
 
 // The size of the buffer for the outbound channel for the queue.
 const choutBufSize = 10
 
 type eventQueue struct {
-	ctx   context.Context
-	chout chan Event
-	chin  <-chan BackendEvent
-	kinds map[string]proto.Message
+	closec chan struct{}
+	chout  chan Event
+	chin   <-chan BackendEvent
+	kinds  map[string]proto.Message
 }
 
-func newQueue(ctx context.Context, chin <-chan BackendEvent, kinds map[string]proto.Message) *eventQueue {
+func newQueue(chin <-chan BackendEvent, kinds map[string]proto.Message) *eventQueue {
 	eq := &eventQueue{
-		ctx:   ctx,
-		chout: make(chan Event, choutBufSize),
-		chin:  chin,
-		kinds: kinds,
+		closec: make(chan struct{}),
+		chout:  make(chan Event, choutBufSize),
+		chin:   chin,
+		kinds:  kinds,
 	}
 	go eq.run()
 	return eq
-}
-
-func (q *eventQueue) convertValue(ev BackendEvent) (Event, error) {
-	pbSpec, err := cloneMessage(ev.Kind, q.kinds)
-	if err != nil {
-		return Event{}, err
-	}
-	if ev.Value == nil {
-		return Event{Key: ev.Key, Type: ev.Type}, nil
-	}
-	if err = convert(ev.Key, ev.Value.Spec, pbSpec); err != nil {
-		return Event{}, err
-	}
-	return Event{Key: ev.Key, Type: ev.Type, Value: &Resource{
-		Metadata: ev.Value.Metadata,
-		Spec:     pbSpec,
-	}}, nil
 }
 
 func (q *eventQueue) run() {
 loop:
 	for {
 		select {
-		case <-q.ctx.Done():
+		case <-q.closec:
 			break loop
 		case ev := <-q.chin:
-			converted, err := q.convertValue(ev)
+			converted, err := ConvertValue(ev, q.kinds)
 			if err != nil {
-				glog.Errorf("Failed to convert %s an event: %v", ev.Key, err)
+				log.Errorf("Failed to convert %s an event: %v", ev.Key, err)
 				break
 			}
 			evs := []Event{converted}
 			for len(evs) > 0 {
 				select {
-				case <-q.ctx.Done():
+				case <-q.closec:
 					break loop
 				case ev := <-q.chin:
-					converted, err = q.convertValue(ev)
+					converted, err = ConvertValue(ev, q.kinds)
 					if err != nil {
-						glog.Errorf("Failed to convert %s an event: %v", ev.Key, err)
+						log.Errorf("Failed to convert %s an event: %v", ev.Key, err)
 						break
 					}
 					evs = append(evs, converted)

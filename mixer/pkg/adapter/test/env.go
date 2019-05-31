@@ -24,16 +24,14 @@ import (
 
 // Env is an adapter environment that defers to the testing context t. Tracks all messages logged so they can be tested against.
 type Env struct {
-	t *testing.T
-
 	done chan struct{} // A channel to notify async work done
 	lock sync.Mutex    // guards logs
 	logs []string
 }
 
 // NewEnv returns an adapter environment that redirects logging output to the given testing context.
-func NewEnv(t *testing.T) *Env {
-	return &Env{t, make(chan struct{}), sync.Mutex{}, make([]string, 0)}
+func NewEnv(_ *testing.T) *Env {
+	return &Env{make(chan struct{}), sync.Mutex{}, make([]string, 0)}
 }
 
 // Logger returns a logger that writes to testing.T.Log
@@ -73,8 +71,28 @@ func (e *Env) Errorf(format string, args ...interface{}) error {
 	return fmt.Errorf(s)
 }
 
-// VerbosityLevel return true for test envs (all verbosity levels enabled).
-func (e *Env) VerbosityLevel(level adapter.VerbosityLevel) bool {
+// Debugf logs the provided message.
+func (e *Env) Debugf(format string, args ...interface{}) {
+	e.log(format, args...)
+}
+
+// InfoEnabled logs the provided message.
+func (e *Env) InfoEnabled() bool {
+	return true
+}
+
+// WarnEnabled logs the provided message.
+func (e *Env) WarnEnabled() bool {
+	return true
+}
+
+// ErrorEnabled logs the provided message.
+func (e *Env) ErrorEnabled() bool {
+	return true
+}
+
+// DebugEnabled logs the provided message.
+func (e *Env) DebugEnabled() bool {
 	return true
 }
 
@@ -94,7 +112,6 @@ func (e *Env) log(format string, args ...interface{}) string {
 	e.logs = append(e.logs, l)
 	e.lock.Unlock()
 
-	e.t.Log(l)
 	return l
 }
 

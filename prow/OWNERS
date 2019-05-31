@@ -1,3 +1,10 @@
+options:
+  no_parent_owners: true
+
+reviewers:
+  - wg-testing
 approvers:
-  - sebastienvas
-  - yutongz
+  - wg-testing-leads
+
+labels:
+  - ci/prow

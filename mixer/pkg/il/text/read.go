@@ -209,7 +209,7 @@ Loop:
 					p.failUnexpectedInput()
 					goto FAILED
 				}
-				id := p.program.Strings().GetID(i)
+				id := p.program.Strings().Add(i)
 				body = append(body, id)
 
 			case il.OpcodeArgFunction:
@@ -218,7 +218,7 @@ Loop:
 					p.failUnexpectedInput()
 					goto FAILED
 				}
-				id := p.program.Strings().GetID(i)
+				id := p.program.Strings().Add(i)
 				body = append(body, id)
 
 			case il.OpcodeArgInt:
@@ -228,8 +228,7 @@ Loop:
 					goto FAILED
 				}
 				t1, t2 := il.IntegerToByteCode(i64)
-				body = append(body, t1)
-				body = append(body, t2)
+				body = append(body, t1, t2)
 
 			case il.OpcodeArgDouble:
 				var i1, i2 uint32
@@ -243,8 +242,7 @@ Loop:
 					p.failUnexpectedInput()
 					goto FAILED
 				}
-				body = append(body, i1)
-				body = append(body, i2)
+				body = append(body, i1, i2)
 
 			case il.OpcodeArgBool:
 				if i, f = p.scanner.asIdentifier(); !f {

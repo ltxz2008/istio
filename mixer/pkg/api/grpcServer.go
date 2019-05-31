@@ -15,60 +15,48 @@
 package api
 
 import (
+	"context"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/golang/glog"
-	rpc "github.com/googleapis/googleapis/google/rpc"
-	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/log"
-	legacyContext "golang.org/x/net/context"
-	"google.golang.org/grpc"
+	"github.com/gogo/googleapis/google/rpc"
+	"github.com/hashicorp/go-multierror"
+	"github.com/opentracing/opentracing-go"
+	otlog "github.com/opentracing/opentracing-go/log"
 	"google.golang.org/grpc/codes"
+	grpc "google.golang.org/grpc/status"
 
 	mixerpb "istio.io/api/mixer/v1"
-	"istio.io/istio/mixer/pkg/adapter"
-	"istio.io/istio/mixer/pkg/adapterManager"
-	"istio.io/istio/mixer/pkg/aspect"
 	"istio.io/istio/mixer/pkg/attribute"
-	"istio.io/istio/mixer/pkg/pool"
-	"istio.io/istio/mixer/pkg/runtime"
+	"istio.io/istio/mixer/pkg/checkcache"
+	"istio.io/istio/mixer/pkg/loadshedding"
+	"istio.io/istio/mixer/pkg/runtime/dispatcher"
 	"istio.io/istio/mixer/pkg/status"
+	attr "istio.io/pkg/attribute"
+	"istio.io/pkg/log"
+	"istio.io/pkg/pool"
 )
-
-// We have a slightly messy situation around the use of context objects. gRPC stubs are
-// generated to expect the old "x/net/context" types instead of the more modern "context".
-// We end up doing a quick switcharoo from the gRPC defined type to the modern type so we can
-// use the modern type elsewhere in the code.
 
 type (
 	// grpcServer holds the dispatchState for the gRPC API server.
 	grpcServer struct {
-		dispatcher       runtime.Dispatcher
-		aspectDispatcher adapterManager.AspectDispatcher
-		gp               *pool.GoroutinePool
+		dispatcher dispatcher.Dispatcher
+		gp         *pool.GoroutinePool
+		cache      *checkcache.Cache
 
 		// the global dictionary. This will eventually be writable via config
 		globalWordList []string
 		globalDict     map[string]int32
+
+		// load shedding
+		throttler *loadshedding.Throttler
 	}
 )
 
-const (
-	// defaultValidDuration is the default duration for which a check or quota result is valid.
-	defaultValidDuration = 10 * time.Second
-	// defaultValidUseCount is the default number of calls for which a check or quota result is valid.
-	defaultValidUseCount = 200
-)
-
-var checkOk = &adapter.CheckResult{
-	ValidDuration: defaultValidDuration,
-	ValidUseCount: defaultValidUseCount,
-}
+var lg = log.RegisterScope("api", "API dispatcher messages.", 0)
 
 // NewGRPCServer creates a gRPC serving stack.
-func NewGRPCServer(aspectDispatcher adapterManager.AspectDispatcher, dispatcher runtime.Dispatcher, gp *pool.GoroutinePool) mixerpb.MixerServer {
+func NewGRPCServer(dispatcher dispatcher.Dispatcher, gp *pool.GoroutinePool, cache *checkcache.Cache, throttler *loadshedding.Throttler) mixerpb.MixerServer {
 	list := attribute.GlobalList()
 	globalDict := make(map[string]int32, len(list))
 	for i := 0; i < len(list); i++ {
@@ -76,191 +64,187 @@ func NewGRPCServer(aspectDispatcher adapterManager.AspectDispatcher, dispatcher 
 	}
 
 	return &grpcServer{
-		dispatcher:       dispatcher,
-		aspectDispatcher: aspectDispatcher,
-		gp:               gp,
-		globalWordList:   list,
-		globalDict:       globalDict,
+		dispatcher:     dispatcher,
+		gp:             gp,
+		globalWordList: list,
+		globalDict:     globalDict,
+		cache:          cache,
+		throttler:      throttler,
 	}
-}
-
-// compatBag implements compatibility between destination.* and target.* attributes.
-type compatBag struct {
-	parent attribute.Bag
-}
-
-func (c *compatBag) DebugString() string {
-	return c.parent.DebugString()
-}
-
-// if a destination.* attribute is missing, check the corresponding target.* attribute.
-func (c *compatBag) Get(name string) (v interface{}, found bool) {
-	v, found = c.parent.Get(name)
-	if found {
-		return
-	}
-	if !strings.HasPrefix(name, "destination.") {
-		return
-	}
-	compatAttr := strings.Replace(name, "destination.", "target.", 1)
-	v, found = c.parent.Get(compatAttr)
-	if found {
-		glog.Warning("Deprecated attribute found: ", compatAttr)
-	}
-	return
-}
-
-func (c *compatBag) Names() []string {
-	return c.parent.Names()
-}
-
-func (c *compatBag) Done() {
-	c.parent.Done()
 }
 
 // Check is the entry point for the external Check method
-func (s *grpcServer) Check(legacyCtx legacyContext.Context, req *mixerpb.CheckRequest) (*mixerpb.CheckResponse, error) {
-	// TODO: this code doesn't distinguish between RPC failures when communicating with adapters and
-	//       their backend vs. semantic failures. For example, if the adapterDispatcher.Check
-	//       method returns a bad status, is that because an adapter failed an RPC or because the
-	//       request was denied? This will need to be addressed in the new adapter model. In the meantime,
-	//       RPC failure is treated as a semantic denial.
+func (s *grpcServer) Check(ctx context.Context, req *mixerpb.CheckRequest) (*mixerpb.CheckResponse, error) {
+	if s.throttler.Throttle(loadshedding.RequestInfo{PredictedCost: 1.0}) {
+		return nil, grpc.Errorf(codes.Unavailable, "Server is currently overloaded. Please try again.")
+	}
 
-	requestBag := attribute.NewProtoBag(&req.Attributes, s.globalDict, s.globalWordList)
+	lg.Debugf("Check (GlobalWordCount:%d, DeduplicationID:%s, Quota:%v)", req.GlobalWordCount, req.DeduplicationId, req.Quotas)
+	lg.Debug("Dispatching Preprocess Check")
+
+	if req.GlobalWordCount > uint32(len(s.globalWordList)) {
+		err := fmt.Errorf("inconsistent global dictionary versions used: mixer knows %d words, caller knows %d", len(s.globalWordList), req.GlobalWordCount)
+		lg.Errora("Check failed: ", err.Error())
+		return nil, grpc.Errorf(codes.Internal, err.Error())
+	}
+
+	// bag around the input proto that keeps track of reference attributes
+	protoBag := attribute.GetProtoBag(&req.Attributes, s.globalDict, s.globalWordList)
+
+	if s.cache != nil {
+		if value, ok := s.cache.Get(protoBag); ok {
+			resp := &mixerpb.CheckResponse{
+				Precondition: mixerpb.CheckResponse_PreconditionResult{
+					Status: rpc.Status{
+						Code:    value.StatusCode,
+						Message: value.StatusMessage,
+					},
+					ValidDuration:        time.Until(value.Expiration),
+					ValidUseCount:        value.ValidUseCount,
+					ReferencedAttributes: &value.ReferencedAttributes,
+					RouteDirective:       value.RouteDirective,
+				},
+			}
+
+			if status.IsOK(resp.Precondition.Status) {
+				lg.Debug("Check approved from cache")
+			} else {
+				lg.Debugf("Check denied from cache: %v", resp.Precondition.Status)
+			}
+
+			if !status.IsOK(resp.Precondition.Status) || len(req.Quotas) == 0 {
+				// we found a cached result and no quotas to allocate, so we're outta here
+				return resp, nil
+			}
+		}
+	}
+
+	// This holds the output state of preprocess operations
+	checkBag := attr.GetMutableBag(protoBag)
+
+	resp, err := s.check(ctx, req, protoBag, checkBag)
+
+	protoBag.Done()
+	checkBag.Done()
+
+	return resp, err
+}
+
+func (s *grpcServer) check(ctx context.Context, req *mixerpb.CheckRequest,
+	protoBag *attribute.ProtoBag, checkBag *attr.MutableBag) (*mixerpb.CheckResponse, error) {
 
 	globalWordCount := int(req.GlobalWordCount)
 
-	// compatReqBag ensures that preprocessor input handles deprecated attributes gracefully.
-	compatReqBag := &compatBag{requestBag}
-	preprocResponseBag := attribute.GetMutableBag(nil)
-
-	glog.V(1).Info("Dispatching Preprocess Check")
-	out := s.aspectDispatcher.Preprocess(legacyCtx, compatReqBag, preprocResponseBag)
-
-	mutableBag := attribute.GetMutableBag(requestBag)
-	if err := mutableBag.PreserveMerge(preprocResponseBag); err != nil {
-		out = status.WithError(fmt.Errorf("could not merge preprocess attributes into request attributes: %v", err))
-	}
-	compatRespBag := &compatBag{mutableBag}
-
-	if !status.IsOK(out) {
-		glog.Error("Preprocess Check returned with: ", status.String(out))
-		requestBag.Done()
-		preprocResponseBag.Done()
-		return nil, makeGRPCError(out)
-	}
-	glog.V(1).Info("Preprocess Check returned with: ", status.String(out))
-
-	if glog.V(2) {
-		glog.Info("Dispatching to main adapters after running processors")
-		glog.Info("Attribute Bag: \n", mutableBag.DebugString())
+	if err := s.dispatcher.Preprocess(ctx, protoBag, checkBag); err != nil {
+		err = fmt.Errorf("preprocessing attributes failed: %v", err)
+		lg.Errora("Check failed: ", err.Error())
+		return nil, grpc.Errorf(codes.Internal, err.Error())
 	}
 
-	glog.V(1).Info("Dispatching Check")
-	cr, err := s.dispatcher.Check(legacyCtx, compatRespBag)
+	lg.Debug("Dispatching to main adapters after running processors")
+	lg.Debuga("Attribute Bag: \n", checkBag)
+	lg.Debug("Dispatching Check")
+
+	// snapshot the state after we've called the APAs so that we can reuse it
+	// for every check + quota call.
+	snapApa := protoBag.Snapshot()
+
+	cr, err := s.dispatcher.Check(ctx, checkBag)
 	if err != nil {
-		out = status.WithError(err)
+		err = fmt.Errorf("performing check operation failed: %v", err)
+		lg.Errora("Check failed: ", err.Error())
+		return nil, grpc.Errorf(codes.Internal, err.Error())
 	}
 
-	if cr == nil {
-		// This request was NOT subject to any checks, let it through.
-		cr = checkOk
+	if status.IsOK(cr.Status) {
+		lg.Debug("Check approved")
 	} else {
-		out = cr.Status
+		lg.Debugf("Check denied: %v", cr.Status)
 	}
 
 	resp := &mixerpb.CheckResponse{
 		Precondition: mixerpb.CheckResponse_PreconditionResult{
-			ValidDuration:        cr.ValidDuration,
-			ValidUseCount:        cr.ValidUseCount,
-			Status:               out,
-			ReferencedAttributes: requestBag.GetReferencedAttributes(s.globalDict, globalWordCount),
+			ValidDuration: cr.ValidDuration,
+			ValidUseCount: cr.ValidUseCount,
+			Status: rpc.Status{
+				Code:    cr.Status.Code,
+				Message: cr.Status.Message,
+			},
+			ReferencedAttributes: protoBag.GetReferencedAttributes(s.globalDict, globalWordCount),
+			RouteDirective:       cr.RouteDirective,
 		},
 	}
 
-	if status.IsOK(out) {
-		glog.V(2).Info("Check returned with ok")
-	} else {
-		glog.Error("Check returned with error : ", status.String(out))
+	if s.cache != nil {
+		// keep this for later...
+		s.cache.Set(protoBag, checkcache.Value{
+			StatusCode:           resp.Precondition.Status.Code,
+			StatusMessage:        resp.Precondition.Status.Message,
+			Expiration:           time.Now().Add(resp.Precondition.ValidDuration),
+			ValidUseCount:        resp.Precondition.ValidUseCount,
+			ReferencedAttributes: *resp.Precondition.ReferencedAttributes,
+			RouteDirective:       resp.Precondition.RouteDirective,
+		})
 	}
-	requestBag.ClearReferencedAttributes()
 
 	if status.IsOK(resp.Precondition.Status) && len(req.Quotas) > 0 {
 		resp.Quotas = make(map[string]mixerpb.CheckResponse_QuotaResult, len(req.Quotas))
-		var qr *mixerpb.CheckResponse_QuotaResult
 
-		// TODO: should dispatch this loop in parallel
-		// WARNING: if this is dispatched in parallel, then we need to do
-		//          use a different protoBag for each individual goroutine
-		//          such that we can get valid usage info for individual attributes.
 		for name, param := range req.Quotas {
-			qma := &aspect.QuotaMethodArgs{
+			qma := dispatcher.QuotaMethodArgs{
 				Quota:           name,
 				Amount:          param.Amount,
 				DeduplicationID: req.DeduplicationId + name,
 				BestEffort:      param.BestEffort,
 			}
-			var err error
 
-			qr, err = quota(legacyCtx, s.dispatcher, compatRespBag, qma)
-			// if quota check fails, set status for the entire request and stop processing.
+			// restore to the post-APA state
+			protoBag.Restore(snapApa)
+
+			lg.Debuga("Dispatching Quota: ", qma.Quota)
+
+			crqr := mixerpb.CheckResponse_QuotaResult{}
+
+			qr, err := s.dispatcher.Quota(ctx, checkBag, qma)
 			if err != nil {
-				resp.Precondition.Status = status.WithError(err)
-				requestBag.ClearReferencedAttributes()
-				break
-			}
-
-			// If qma.Quota does not apply to this request give the client what it asked for.
-			// Effectively the quota is unlimited.
-			if qr == nil {
-				qr = &mixerpb.CheckResponse_QuotaResult{
-					ValidDuration: defaultValidDuration,
-					GrantedAmount: qma.Amount,
+				err = fmt.Errorf("performing quota alloc failed: %v", err)
+				lg.Errora("Quota failure: ", err.Error())
+				// we continue the quota loop even after this error
+			} else {
+				if !status.IsOK(qr.Status) {
+					lg.Debugf("Quota denied: %v", qr.Status)
 				}
+				crqr.ValidDuration = qr.ValidDuration
+				crqr.GrantedAmount = qr.Amount
 			}
 
-			qr.ReferencedAttributes = requestBag.GetReferencedAttributes(s.globalDict, globalWordCount)
-			resp.Quotas[name] = *qr
-			requestBag.ClearReferencedAttributes()
+			lg.Debugf("Quota '%s' result: %#v", qma.Quota, crqr)
+
+			crqr.ReferencedAttributes = *protoBag.GetReferencedAttributes(s.globalDict, globalWordCount)
+			resp.Quotas[name] = crqr
 		}
 	}
 
-	requestBag.Done()
-	preprocResponseBag.Done()
-
 	return resp, nil
-}
-
-func quota(legacyCtx legacyContext.Context, d runtime.Dispatcher, bag attribute.Bag,
-	qma *aspect.QuotaMethodArgs) (*mixerpb.CheckResponse_QuotaResult, error) {
-	if d == nil {
-		return nil, nil
-	}
-	glog.V(1).Info("Dispatching Quota: ", qma.Quota)
-	qmr, err := d.Quota(legacyCtx, bag, qma)
-	if err != nil {
-		// TODO record the error in the quota specific result
-		glog.Warningf("Quota %s returned error: %v", qma.Quota, err)
-		return nil, err
-	}
-
-	if qmr == nil { // no quota applied for the given request
-		return nil, nil
-	}
-
-	if glog.V(4) {
-		glog.Infof("Quota '%s' result: %#v", qma.Quota, qmr.Status)
-	}
-	return &mixerpb.CheckResponse_QuotaResult{
-		GrantedAmount: qmr.Amount,
-		ValidDuration: qmr.ValidDuration,
-	}, nil
 }
 
 var reportResp = &mixerpb.ReportResponse{}
 
 // Report is the entry point for the external Report method
-func (s *grpcServer) Report(legacyCtx legacyContext.Context, req *mixerpb.ReportRequest) (*mixerpb.ReportResponse, error) {
+func (s *grpcServer) Report(ctx context.Context, req *mixerpb.ReportRequest) (*mixerpb.ReportResponse, error) {
+
+	if s.throttler.Throttle(loadshedding.RequestInfo{PredictedCost: float64(len(req.Attributes))}) {
+		return nil, grpc.Errorf(codes.Unavailable, "Server is currently overloaded. Please try again.")
+	}
+
+	lg.Debugf("Report (Count: %d)", len(req.Attributes))
+
+	if req.GlobalWordCount > uint32(len(s.globalWordList)) {
+		err := fmt.Errorf("inconsistent global dictionary versions used: mixer knows %d words, caller knows %d", len(s.globalWordList), req.GlobalWordCount)
+		lg.Errora("Report failed: ", err.Error())
+		return nil, grpc.Errorf(codes.Internal, err.Error())
+	}
+
 	if len(req.Attributes) == 0 {
 		// early out
 		return reportResp, nil
@@ -273,81 +257,96 @@ func (s *grpcServer) Report(legacyCtx legacyContext.Context, req *mixerpb.Report
 		}
 	}
 
-	protoBag := attribute.NewProtoBag(&req.Attributes[0], s.globalDict, s.globalWordList)
-	requestBag := attribute.GetMutableBag(protoBag)
-	compatReqBag := &compatBag{requestBag}
-	preprocResponseBag := attribute.GetMutableBag(nil)
+	reportSpan, reportCtx := opentracing.StartSpanFromContext(ctx, "Report")
+	reporter := s.dispatcher.GetReporter(reportCtx)
 
-	var err error
-	for i := 0; i < len(req.Attributes); i++ {
-		span, newctx := opentracing.StartSpanFromContext(legacyCtx, fmt.Sprintf("Attributes %d", i))
+	var errors *multierror.Error
 
-		// the first attribute block is handled by the protoBag as a foundation,
-		// deltas are applied to the child bag (i.e. requestBag)
-		if i > 0 {
-			err = requestBag.UpdateBagFromProto(&req.Attributes[i], s.globalWordList)
-			if err != nil {
-				msg := "Request could not be processed due to invalid attributes."
-				glog.Error(msg, "\n", err)
-				details := status.NewBadRequest("attributes", err)
-				err = makeGRPCError(status.InvalidWithDetails(msg, details))
+	var protoBag *attribute.ProtoBag
+	var accumBag *attr.MutableBag
+	var reportBag *attr.MutableBag
+
+	totalBags := len(req.Attributes)
+	for i := range req.Attributes {
+		lg.Debugf("Dispatching Report %d out of %d", i+1, totalBags)
+		span, newctx := opentracing.StartSpanFromContext(reportCtx, fmt.Sprintf("attribute bag %d", i))
+
+		switch req.RepeatedAttributesSemantics {
+		case mixerpb.DELTA_ENCODING:
+			if i == 0 {
+				protoBag = attribute.GetProtoBag(&req.Attributes[i], s.globalDict, s.globalWordList)
+				accumBag = attr.GetMutableBag(protoBag)
+				reportBag = attr.GetMutableBag(accumBag)
+			} else if err := attribute.UpdateBagFromProto(accumBag, &req.Attributes[i], s.globalWordList); err != nil {
+				err = fmt.Errorf("request could not be processed due to invalid attributes: %v", err)
+				span.LogFields(otlog.String("error", err.Error()))
+				span.Finish()
+				errors = multierror.Append(errors, err)
 				break
+			}
+			if err := dispatchSingleReport(newctx, s.dispatcher, reporter, accumBag, reportBag); err != nil {
+				span.LogFields(otlog.String("error", err.Error()))
+				span.Finish()
+				errors = multierror.Append(errors, err)
+				continue
+			}
+		case mixerpb.INDEPENDENT_ENCODING:
+			protoBag = attribute.GetProtoBag(&req.Attributes[i], s.globalDict, s.globalWordList)
+			reportBag = attr.GetMutableBag(protoBag)
+			if err := dispatchSingleReport(newctx, s.dispatcher, reporter, protoBag, reportBag); err != nil {
+				span.LogFields(otlog.String("error", err.Error()))
+				span.Finish()
+				errors = multierror.Append(errors, err)
+				continue
 			}
 		}
 
-		glog.V(1).Info("Dispatching Preprocess")
-		out := s.aspectDispatcher.Preprocess(newctx, compatReqBag, preprocResponseBag)
-		mutableBag := attribute.GetMutableBag(requestBag)
-		if err := mutableBag.PreserveMerge(preprocResponseBag); err != nil {
-			out = status.WithError(fmt.Errorf("could not merge preprocess attributes into request attributes: %v", err))
-		}
-		compatRespBag := &compatBag{mutableBag}
-		if !status.IsOK(out) {
-			glog.Error("Preprocess returned with: ", status.String(out))
-			err = makeGRPCError(out)
-			span.LogFields(log.String("error", err.Error()))
-			span.Finish()
-			break
-		}
-		glog.V(1).Info("Preprocess returned with: ", status.String(out))
-
-		if glog.V(2) {
-			glog.Info("Dispatching to main adapters after running processors")
-			glog.Info("Attribute Bag: \n", mutableBag.DebugString())
-		}
-
-		glog.V(1).Infof("Dispatching Report %d out of %d", i, len(req.Attributes))
-		err = s.dispatcher.Report(legacyCtx, compatRespBag)
-		if err != nil {
-			out = status.WithError(err)
-			glog.Warningf("Report returned %v", err)
-		}
-
-		if !status.IsOK(out) {
-			glog.Errorf("Report %d returned with: %s", i, status.String(out))
-			err = makeGRPCError(out)
-			span.LogFields(log.String("error", err.Error()))
-			span.Finish()
-			break
-		}
-		glog.V(1).Infof("Report %d returned with: %s", i, status.String(out))
-
-		span.LogFields(log.String("success", "finished Report for attribute bag "+string(i)))
 		span.Finish()
-		preprocResponseBag.Reset()
+
+		switch req.RepeatedAttributesSemantics {
+		case mixerpb.DELTA_ENCODING:
+			reportBag.Reset()
+		case mixerpb.INDEPENDENT_ENCODING:
+			reportBag.Done()
+			protoBag.Done()
+		}
 	}
 
-	preprocResponseBag.Done()
-	requestBag.Done()
-	protoBag.Done()
+	if req.RepeatedAttributesSemantics == mixerpb.DELTA_ENCODING {
+		accumBag.Done()
+		reportBag.Done()
+		protoBag.Done()
+	}
 
-	if err != nil {
-		return nil, err
+	if err := reporter.Flush(); err != nil {
+		errors = multierror.Append(errors, err)
+	}
+	reporter.Done()
+
+	if errors != nil {
+		reportSpan.LogFields(otlog.String("error", errors.Error()))
+	}
+	reportSpan.Finish()
+
+	if errors != nil {
+		lg.Errora("Report failed: ", errors.Error())
+		return nil, grpc.Errorf(codes.Unknown, errors.Error())
 	}
 
 	return reportResp, nil
 }
 
-func makeGRPCError(status rpc.Status) error {
-	return grpc.Errorf(codes.Code(status.Code), status.Message)
+func dispatchSingleReport(ctx context.Context, preprocessor dispatcher.Dispatcher, reporter dispatcher.Reporter,
+	attributesBag attribute.Bag, reportBag *attr.MutableBag) error {
+
+	lg.Debug("Dispatching Preprocess")
+
+	if err := preprocessor.Preprocess(ctx, attributesBag, reportBag); err != nil {
+		return fmt.Errorf("preprocessing attributes failed: %v", err)
+	}
+
+	lg.Debug("Dispatching to main adapters after running preprocessors")
+	lg.Debuga("Attribute Bag: \n", reportBag)
+
+	return reporter.Report(reportBag)
 }

@@ -21,49 +21,49 @@ import (
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
-	"github.com/golang/glog"
-)
 
-const (
-	ruleKind      = "rule"
-	selectorField = "selector"
-	matchField    = "match"
+	"istio.io/pkg/log"
 )
-
-// warnDeprecationAndFix warns users about deprecated fields.
-// It maps the field into new name.
-func warnDeprecationAndFix(key Key, spec map[string]interface{}) map[string]interface{} {
-	if key.Kind != ruleKind {
-		return spec
-	}
-	sel := spec[selectorField]
-	if sel == nil {
-		return spec
-	}
-	glog.Warningf("Deprecated field 'selector' used in %s. Use 'match' instead.", key)
-	spec[matchField] = sel
-	delete(spec, selectorField)
-	return spec
-}
 
 // cloneMessage looks up the kind in the map, and creates a clone of it.
 func cloneMessage(kind string, kinds map[string]proto.Message) (proto.Message, error) {
 	msg, ok := kinds[kind]
 	if !ok {
-		return nil, fmt.Errorf("unrecognized kind %s", kind)
+		return nil, fmt.Errorf("unrecognized kind %q", kind)
 	}
 	return proto.Clone(msg), nil
 }
 
 // convert converts unstructured spec into the target proto.
 func convert(key Key, spec map[string]interface{}, target proto.Message) error {
-	jsonData, err := json.Marshal(warnDeprecationAndFix(key, spec))
+	jsonData, err := json.Marshal(spec)
 	if err != nil {
 		return err
 	}
 	if err = jsonpb.Unmarshal(bytes.NewReader(jsonData), target); err != nil {
-		glog.Warningf("%s unable to unmarshal: %s, %s", key, err.Error(), string(jsonData))
+		log.Warnf("%s unable to unmarshal: %s, %s", key, err.Error(), string(jsonData))
 	}
 
 	return err
+}
+
+// ConvertValue from JSON using a protobuf mapping
+func ConvertValue(ev BackendEvent, kinds map[string]proto.Message) (Event, error) {
+	pbSpec, err := cloneMessage(ev.Kind, kinds)
+	if err != nil {
+		return Event{}, err
+	}
+	if ev.Value == nil {
+		return Event{Key: ev.Key, Type: ev.Type}, nil
+	}
+	if err = convert(ev.Key, ev.Value.Spec, pbSpec); err != nil {
+		return Event{}, err
+	}
+	return Event{
+		Key:  ev.Key,
+		Type: ev.Type,
+		Value: &Resource{
+			Metadata: ev.Value.Metadata,
+			Spec:     pbSpec,
+		}}, nil
 }

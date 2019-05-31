@@ -16,45 +16,21 @@ package util
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/golang/glog"
+	"istio.io/pkg/log"
 )
-
-// Run command and stream output
-func Run(command string) error {
-	glog.V(2).Info(command)
-	parts := strings.Split(command, " ")
-	/* #nosec */
-	c := exec.Command(parts[0], parts[1:]...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
-}
-
-// RunInput command and pass input via stdin
-func RunInput(command, input string) error {
-	glog.V(2).Infof("Run %q on input:\n%s", command, input)
-	parts := strings.Split(command, " ")
-	/* #nosec */
-	c := exec.Command(parts[0], parts[1:]...)
-	c.Stdin = strings.NewReader(input)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
-}
 
 // Shell out a command and aggregate output
 func Shell(command string) (string, error) {
-	glog.V(2).Info(command)
+	log.Info(command)
 	parts := strings.Split(command, " ")
 	/* #nosec */
 	c := exec.Command(parts[0], parts[1:]...)
 	bytes, err := c.CombinedOutput()
 	if err != nil {
-		glog.V(2).Info(string(bytes))
+		log.Info(string(bytes))
 		return "", fmt.Errorf("command %q failed: %q %v", command, string(bytes), err)
 	}
 	return string(bytes), nil

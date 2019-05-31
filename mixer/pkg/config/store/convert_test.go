@@ -20,7 +20,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 
-	cfg "istio.io/istio/mixer/pkg/config/proto"
+	cfg "istio.io/api/policy/v1beta1"
 )
 
 func TestConvert(t *testing.T) {
@@ -49,6 +49,21 @@ func TestConvert(t *testing.T) {
 		if !reflect.DeepEqual(tt.dest, tt.expected) {
 			t.Errorf("%s: Got %+v, Want %+v", tt.title, tt.dest, tt.expected)
 		}
+	}
+
+	ev := BackendEvent{
+		Key: Key{
+			Kind: "handler",
+		},
+	}
+	want := Event{
+		Key: Key{
+			Kind: "handler",
+		},
+	}
+
+	if got, err := ConvertValue(ev, map[string]proto.Message{"handler": &cfg.Handler{}}); err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("ConvertValue(%#v) => got %#v, %v, want %#v", ev, got, err, want)
 	}
 }
 
